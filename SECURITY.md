@@ -19,8 +19,6 @@ Please report suspected security vulnerabilities privately — **do not**
 open a public GitHub/GitLab issue.
 
 - **Report here:** https://security.fgtclb.com (our secure incident report form)
-- **PGP key (optional, for encrypted reports):** {{PGP_KEY_URL_OR_FINGERPRINT}} —
-  encrypt your report and attach it as a file in the form above
 - **Please include:** the affected product and version(s), a description
   of the issue, steps to reproduce or a proof of concept, and the
   potential impact.
