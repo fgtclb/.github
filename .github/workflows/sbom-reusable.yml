@@ -1,0 +1,215 @@
+# .github/workflows/sbom-reusable.yml — reusable SBOM workflow.
+#
+# Home: a PUBLIC `<org>/.github` repository (neither web-vision/.github nor fgtclb/.github exists
+# today; both must be created). Public is required because 81 of 99 repos are public and both orgs
+# are on the GitHub Free plan, where org secrets serve public repos only and a private `.github`
+# repo would need its Actions access level raised to `organization`.
+#
+# IMPORTANT: prefer the central orchestrator for coverage. This workflow exists for repositories
+# that genuinely need per-tag freshness — typically the ones that publish to TER or Packagist.
+# It must NOT be added to:
+#   * the 12 fgtclb monorepo split repos (the monorepo owns their workflow files and overwrites them)
+#   * forks (23) — GitHub disables scheduled workflows in forks by default
+#   * repos dormant >60 days — GitHub auto-disables their scheduled workflows silently
+name: SBOM (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # Supply the Dependency-Track base URL EITHER as this input (plain, visible in logs) OR as
+      # the DTRACK_API_URL secret below. The secret wins if both are set. `required: false` because
+      # an input cannot default to a secret, and an empty string counts as "provided" — which is
+      # exactly how a missing value used to slip through to the upload step.
+      dtrack_url:      { required: false, type: string, default: "" }
+      project_name:    { required: false, type: string, default: "" }
+      sbom_class:      { required: false, type: string, default: "" }
+      core_versions:   { required: false, type: string, default: "" }
+      php_version:     { required: false, type: string, default: "8.3" }
+      # First run against any repository should be dry_run: true — it generates and validates the
+      # BOMs and prints a summary, but does not contact Dependency-Track.
+      dry_run:         { required: false, type: boolean, default: false }
+      sbom_tools_ref:  { required: false, type: string, default: "main" }
+      # Regenerate the SBOM for an arbitrary ref - typically an already-published release tag, when
+      # an incident makes it necessary to know what that release resolves to TODAY. Empty means the
+      # ref the workflow was triggered on.
+      #
+      # This is an input rather than dispatching the workflow itself at the tag, because
+      # `gh workflow run … --ref v1.2.3` requires the workflow FILE to exist on that tag, which is
+      # false for every release published before the workflow was added.
+      target_ref:      { required: false, type: string, default: "" }
+    secrets:
+      DTRACK_API_KEY:  { required: true }
+      DTRACK_API_URL:  { required: false }
+      COMPOSER_AUTH:   { required: false }
+
+permissions:
+  contents: read          # default GITHUB_TOKEN is read-write in both orgs; narrow it explicitly.
+
+jobs:
+  sbom:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: "Check Dependency-Track configuration"
+        # Fail before generating anything. Without this the job resolves dependencies, builds every
+        # BOM and only then dies on the first upload, which buries the real cause under a wall of
+        # composer output.
+        env:
+          DTRACK_API_URL: ${{ secrets.DTRACK_API_URL || inputs.dtrack_url }}
+          DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            # Dry run never contacts Dependency-Track (sbom-upload.sh returns before it reads the
+            # credentials), so neither value is required. This is the mode to use when the instance
+            # is unreachable from GitHub-hosted runners but the BOMs should still be validated.
+            echo "Dry run: Dependency-Track configuration not required."
+            exit 0
+          fi
+          if [ -z "${DTRACK_API_URL:-}" ]; then
+            echo "::error::DTRACK_API_URL is empty. Pass it either as the 'dtrack_url' input or as"
+            echo "::error::the 'DTRACK_API_URL' secret. Note that an org *variable* (vars.*) and an"
+            echo "::error::org *secret* (secrets.*) are different namespaces - this organisation"
+            echo "::error::holds DTRACK_API_URL as a secret, so the caller must pass it under"
+            echo "::error::secrets:, not with:."
+            exit 1
+          fi
+          [ -n "${DTRACK_API_KEY:-}" ] || { echo "::error::DTRACK_API_KEY is empty."; exit 1; }
+          # curl writes %{http_code} even when it fails, emitting 000 - so take its output as-is
+          # rather than appending a fallback, which would produce "000000" and defeat the test.
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+                   "${DTRACK_API_URL%/}/api/version" 2>/dev/null || true)"
+          case "${code:-000}" in
+            000|"")
+              echo "::error::Cannot reach ${DTRACK_API_URL%/} from a GitHub-hosted runner."
+              echo "::error::If Dependency-Track is internal-only, do not expose it - let the"
+              echo "::error::central orchestrator upload these repositories instead, or run this"
+              echo "::error::workflow with dry_run: true to generate and validate BOMs only."
+              exit 1
+              ;;
+          esac
+          echo "Dependency-Track responded with HTTP $code"
+
+      - name: "Checkout"
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.target_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: "Setup PHP"
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+          tools: composer:v2
+          coverage: none
+
+      - name: "Fetch SBOM scripts"
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/.github
+          path: .sbom-tools
+          ref: ${{ inputs.sbom_tools_ref }}
+
+      - name: "Generate SBOM"
+        id: gen
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          COMPOSER_HOME: /tmp/composer-sbom
+        run: |
+          set -euo pipefail
+          TARGET_REF='${{ inputs.target_ref }}'
+          chmod +x .sbom-tools/scripts/*.sh
+          NAME='${{ inputs.project_name }}'
+          [ -n "$NAME" ] || NAME="$(jq -r '.name // empty' composer.json 2>/dev/null || true)"
+          [ -n "$NAME" ] || NAME="github.com/${GITHUB_REPOSITORY}"
+          CLASS='${{ inputs.sbom_class }}'
+          if [ -z "$CLASS" ]; then
+            if [ -f composer.lock ]; then
+              CLASS=composer-lock
+            elif ls core-*/composer.lock >/dev/null 2>&1; then
+              CLASS=composer-corelocks
+            else
+              # A lockless extension supporting more than one TYPO3 core major needs one BOM per
+              # core; a single resolve would silently pick one branch of "^12.4 || ^13.4".
+              MAJORS="$(.sbom-tools/scripts/derive-core-versions.sh composer.json | tr '\n' ' ')"
+              if [ "$(printf '%s' "$MAJORS" | wc -w)" -gt 1 ]; then
+                CLASS=composer-resolve-matrix
+              else
+                CLASS=composer-resolve
+              fi
+              echo "detected TYPO3 core majors: ${MAJORS:-none}"
+            fi
+          fi
+          # Component version for the BOM metadata: the target ref if one was given, else the ref
+          # the run was triggered on, with a leading v stripped.
+          COMPONENT_VERSION="${TARGET_REF:-$GITHUB_REF_NAME}"; COMPONENT_VERSION="${COMPONENT_VERSION#v}"
+          echo "name=$NAME"   >> "$GITHUB_OUTPUT"
+          echo "class=$CLASS" >> "$GITHUB_OUTPUT"
+          .sbom-tools/scripts/sbom-generate.sh \
+            --dir . --class "$CLASS" --name "$NAME" \
+            --version "$COMPONENT_VERSION" \
+            ${{ inputs.core_versions && format('--core-versions "{0}"', inputs.core_versions) || '' }} \
+            --out sbom-output > sbom-manifest.tsv
+          cat sbom-manifest.tsv
+
+      - name: "Validate and upload SBOMs"
+        env:
+          DTRACK_API_URL: ${{ secrets.DTRACK_API_URL || inputs.dtrack_url }}
+          DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
+        run: |
+          set -euo pipefail
+          NAME='${{ steps.gen.outputs.name }}'
+          DRY=''
+          [ '${{ inputs.dry_run }}' = 'true' ] && DRY='--dry-run'
+          TARGET='${{ inputs.target_ref }}'
+          if [ -n "$TARGET" ]; then
+            # An explicit target wins, and is reported verbatim: a rescan of v1.2.3 must land in the
+            # v1.2.3 project version, not in the default branch's.
+            PVER="$TARGET"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            PVER="$GITHUB_REF_NAME"
+          else
+            PVER="$(git rev-parse --abbrev-ref HEAD)"
+          fi
+          {
+            echo "### SBOM"
+            echo
+            echo "| document | components | DT project version |"
+            echo "|---|---:|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # isLatest is single-valued per project NAME, and promoting a version clears the flag on
+          # the previous holder. An extension that emits one document per supported TYPO3 core
+          # produces concurrent variants, not successive ones, so promoting them in turn would just
+          # demote each other on every run. Only promote when this repository yields exactly one
+          # document.
+          DOCS="$(grep -c . sbom-manifest.tsv)"
+          LATEST='--latest'
+          if [ "$DOCS" -gt 1 ]; then
+            LATEST=''
+            echo "::notice::$DOCS documents produced (one per supported core); isLatest not set - "\
+                 "there is no single latest among concurrent core variants."
+          fi
+          while IFS=$'\t' read -r bom variant; do
+            PV="$PVER"; [ "$variant" != "default" ] && PV="${PVER}+${variant}"
+            # sbom-upload.sh refuses a BOM with zero components or any version-less PURL, in
+            # dry-run too — so a dry run is a real validation, not just a no-op.
+            .sbom-tools/scripts/sbom-upload.sh --bom "$bom" \
+              --project-name "$NAME" --project-version "$PV" \
+              --tags "host:github.com,org:${GITHUB_REPOSITORY_OWNER}" \
+              --archive-dir bom-archive $LATEST $DRY
+            printf '| `%s` | %s | `%s` |\n' "$(basename "$bom")" \
+              "$(jq '.components|length' "$bom")" "$PV" >> "$GITHUB_STEP_SUMMARY"
+          done < sbom-manifest.tsv
+          if [ -n "$DRY" ]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "_Dry run — nothing was uploaded to Dependency-Track._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: "Store BOMs"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom
+          path: |
+            sbom-output/
+            bom-archive/
+          retention-days: 90
